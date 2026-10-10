@@ -3,7 +3,6 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { broadcastRoomUpdate } from "@/lib/roomEvents";
-import { getClientIp, getSafeIpDir } from "@/lib/clientIp";
 
 const NO_CACHE_HEADERS = {
   "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
@@ -22,7 +21,7 @@ export interface ClipboardFile {
 export interface RoomData {
   code: string;
   roomKey: string;
-  ownerIp: string;
+  ownerIp?: string;
   text: string;
   language: string;
   pin?: string;
@@ -33,67 +32,69 @@ export interface RoomData {
   views?: number;
 }
 
-// Temporary storage located in system temp directory (outside project directory)
+// Ephemeral temporary storage in system temp directory (outside project directory)
 const BASE_STORAGE_DIR =
   process.env.TEMP_STORAGE_DIR || path.join(os.tmpdir(), "open-app-temp-storage");
 const ROOMS_DIR = path.join(BASE_STORAGE_DIR, "rooms");
 
-function ensureRoomsDir(safeIp: string): string {
-  const ipDir = path.join(ROOMS_DIR, safeIp);
-  if (!fs.existsSync(ipDir)) {
-    fs.mkdirSync(ipDir, { recursive: true });
+function ensureRoomsDir(): string {
+  if (!fs.existsSync(ROOMS_DIR)) {
+    fs.mkdirSync(ROOMS_DIR, { recursive: true });
   }
-  return ipDir;
+  return ROOMS_DIR;
 }
 
-function findRoomOnDisk(code: string, currentSafeIp: string): { room: RoomData; ipDir: string } | null {
+function findRoomOnDisk(code: string): { room: RoomData; filePath: string } | null {
   const cleanCode = code.toUpperCase().replace(/[^A-Z0-9_-]/g, "");
+  ensureRoomsDir();
 
-  // 1. Check current IP directory first
-  const currentIpDir = path.join(ROOMS_DIR, currentSafeIp);
-  const currentPath = path.join(currentIpDir, `${cleanCode}.json`);
-  if (fs.existsSync(currentPath)) {
+  // 1. Check direct room path
+  const directPath = path.join(ROOMS_DIR, `${cleanCode}.json`);
+  if (fs.existsSync(directPath)) {
     try {
-      const raw = fs.readFileSync(currentPath, "utf-8");
+      const raw = fs.readFileSync(directPath, "utf-8");
       const room: RoomData = JSON.parse(raw);
       if (room.expiresAt && room.expiresAt < Date.now()) {
-        fs.unlinkSync(currentPath);
+        fs.unlinkSync(directPath);
         return null;
       }
-      return { room, ipDir: currentIpDir };
+      return { room, filePath: directPath };
     } catch {}
   }
 
-  // 2. Search across other IP directories to see if room exists on another system
-  if (!fs.existsSync(ROOMS_DIR)) return null;
-  const ipDirs = fs.readdirSync(ROOMS_DIR);
-  for (const ipFolder of ipDirs) {
-    if (ipFolder === currentSafeIp) continue;
-    const testPath = path.join(ROOMS_DIR, ipFolder, `${cleanCode}.json`);
-    if (fs.existsSync(testPath)) {
-      try {
-        const raw = fs.readFileSync(testPath, "utf-8");
-        const room: RoomData = JSON.parse(raw);
-        if (room.expiresAt && room.expiresAt < Date.now()) {
-          fs.unlinkSync(testPath);
-          continue;
+  // 2. Check subfolders (legacy migration from earlier IP-folder structure)
+  try {
+    const entries = fs.readdirSync(ROOMS_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const subPath = path.join(ROOMS_DIR, entry.name, `${cleanCode}.json`);
+        if (fs.existsSync(subPath)) {
+          const raw = fs.readFileSync(subPath, "utf-8");
+          const room: RoomData = JSON.parse(raw);
+          if (room.expiresAt && room.expiresAt < Date.now()) {
+            fs.unlinkSync(subPath);
+            return null;
+          }
+          // Migrate to main rooms dir
+          fs.writeFileSync(directPath, raw, "utf-8");
+          try {
+            fs.unlinkSync(subPath);
+          } catch {}
+          return { room, filePath: directPath };
         }
-        return { room, ipDir: path.join(ROOMS_DIR, ipFolder) };
-      } catch {}
+      }
     }
-  }
+  } catch {}
 
   return null;
 }
 
 export async function GET(request: NextRequest) {
-  const clientIp = getClientIp(request);
-  const safeIp = getSafeIpDir(clientIp);
   const { searchParams } = new URL(request.url);
+  ensureRoomsDir();
 
-  // Listing rooms: ONLY return rooms belonging to THIS computer system's IP!
+  // Listing rooms: Return all active rooms stored on host disk
   if (searchParams.get("list") === "true") {
-    const ipDir = path.join(ROOMS_DIR, safeIp);
     const roomsList: Array<{
       code: string;
       roomKey: string;
@@ -104,13 +105,14 @@ export async function GET(request: NextRequest) {
       isProtected: boolean;
     }> = [];
 
-    if (fs.existsSync(ipDir)) {
-      const files = fs.readdirSync(ipDir);
-      const now = Date.now();
+    const now = Date.now();
+
+    try {
+      const files = fs.readdirSync(ROOMS_DIR);
       for (const file of files) {
         if (!file.endsWith(".json")) continue;
         try {
-          const filePath = path.join(ipDir, file);
+          const filePath = path.join(ROOMS_DIR, file);
           const raw = fs.readFileSync(filePath, "utf-8");
           const room: RoomData = JSON.parse(raw);
 
@@ -130,7 +132,7 @@ export async function GET(request: NextRequest) {
           });
         } catch {}
       }
-    }
+    } catch {}
 
     return NextResponse.json(
       { rooms: roomsList.sort((a, b) => b.updatedAt - a.updatedAt) },
@@ -143,31 +145,14 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Room code required" }, { status: 400 });
   }
 
-  const found = findRoomOnDisk(code, safeIp);
+  const found = findRoomOnDisk(code);
   if (!found) {
     return NextResponse.json({ error: "Room not found", isNew: true }, { status: 404 });
   }
 
-  const { room, ipDir } = found;
+  const { room, filePath } = found;
 
-  // System-wise IP authorization check:
-  // If the room was created on a different computer / IP:
-  // Allow access ONLY if the request contains the valid roomKey (e.g. from QR code or direct share link)
-  const providedKey = searchParams.get("key");
-  const isSameIp = room.ownerIp === clientIp || room.ownerIp === "127.0.0.1" || clientIp === "127.0.0.1";
-  const hasValidKey = room.roomKey && providedKey === room.roomKey;
-
-  if (!isSameIp && !hasValidKey) {
-    return NextResponse.json(
-      {
-        error: "Access restricted: This room belongs to another computer system.",
-        isSystemRestricted: true,
-      },
-      { status: 403, headers: NO_CACHE_HEADERS }
-    );
-  }
-
-  // Check PIN if protected
+  // Check PIN if passcode protected
   const pin = searchParams.get("pin");
   if (room.pin && room.pin !== pin) {
     return NextResponse.json(
@@ -176,15 +161,13 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // Handle self-destruct
+  // Handle self-destruct (burn after reading)
   if (room.selfDestruct && room.views && room.views >= 1) {
-    const filePath = path.join(ipDir, `${code}.json`);
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     return NextResponse.json({ error: "Room self-destructed." }, { status: 410, headers: NO_CACHE_HEADERS });
   }
 
   room.views = (room.views || 0) + 1;
-  const filePath = path.join(ipDir, `${code}.json`);
   fs.writeFileSync(filePath, JSON.stringify(room, null, 2), "utf-8");
 
   return NextResponse.json(
@@ -206,9 +189,7 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const clientIp = getClientIp(request);
-    const safeIp = getSafeIpDir(clientIp);
-
+    ensureRoomsDir();
     const body = await request.json();
     const {
       code,
@@ -225,21 +206,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid room code" }, { status: 400 });
     }
 
-    const cleanCode = code.toUpperCase().trim();
-    const found = findRoomOnDisk(cleanCode, safeIp);
-
-    // If room exists on a different IP, check key authorization
-    if (found && found.room.ownerIp !== clientIp && clientIp !== "127.0.0.1" && found.room.ownerIp !== "127.0.0.1") {
-      if (!found.room.roomKey || roomKey !== found.room.roomKey) {
-        return NextResponse.json(
-          { error: "Access denied: Cannot overwrite another computer's room" },
-          { status: 403, headers: NO_CACHE_HEADERS }
-        );
-      }
-    }
-
+    const cleanCode = code.toUpperCase().trim().replace(/[^A-Z0-9_-]/g, "");
+    const found = findRoomOnDisk(cleanCode);
     const existing = found?.room;
 
+    // Validate PIN if passcode is enabled on existing room
     if (existing?.pin && existing.pin !== pin) {
       return NextResponse.json({ error: "Invalid passcode" }, { status: 401, headers: NO_CACHE_HEADERS });
     }
@@ -250,17 +221,12 @@ export async function POST(request: NextRequest) {
       expiresAt = now + expiryMinutes * 60 * 1000;
     }
 
-    // Save under the creator's IP folder
-    const targetIpDir = found?.ipDir || ensureRoomsDir(safeIp);
-
-    // Generate or preserve security roomKey
     const finalKey =
       existing?.roomKey || roomKey || Math.random().toString(36).substring(2, 12);
 
     const updatedRoom: RoomData = {
       code: cleanCode,
       roomKey: finalKey,
-      ownerIp: existing?.ownerIp || clientIp,
       text: String(text),
       language: String(language),
       pin: pin !== undefined ? (pin || undefined) : existing?.pin,
@@ -271,10 +237,10 @@ export async function POST(request: NextRequest) {
       views: existing?.views || 0,
     };
 
-    const targetPath = path.join(targetIpDir, `${cleanCode}.json`);
+    const targetPath = path.join(ROOMS_DIR, `${cleanCode}.json`);
     fs.writeFileSync(targetPath, JSON.stringify(updatedRoom, null, 2), "utf-8");
 
-    // Instant real-time push to all connected devices in this room
+    // Instant real-time push to all connected computers & mobile devices in this room
     broadcastRoomUpdate(cleanCode, {
       code: cleanCode,
       roomKey: updatedRoom.roomKey,
@@ -302,8 +268,6 @@ export async function POST(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
-  const clientIp = getClientIp(request);
-  const safeIp = getSafeIpDir(clientIp);
   const { searchParams } = new URL(request.url);
   const code = searchParams.get("code")?.toUpperCase().trim();
 
@@ -311,13 +275,11 @@ export async function DELETE(request: NextRequest) {
     return NextResponse.json({ error: "Room code required" }, { status: 400 });
   }
 
-  const found = findRoomOnDisk(code, safeIp);
-  if (found) {
-    const filePath = path.join(found.ipDir, `${code}.json`);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
+  const cleanCode = code.replace(/[^A-Z0-9_-]/g, "");
+  const found = findRoomOnDisk(cleanCode);
+  if (found && fs.existsSync(found.filePath)) {
+    fs.unlinkSync(found.filePath);
   }
 
-  return NextResponse.json({ success: true, message: `Room ${code} deleted` }, { headers: NO_CACHE_HEADERS });
+  return NextResponse.json({ success: true, message: `Room ${cleanCode} deleted` }, { headers: NO_CACHE_HEADERS });
 }

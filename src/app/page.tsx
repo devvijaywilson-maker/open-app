@@ -162,12 +162,6 @@ export default function Home() {
           }
         );
 
-        if (res.status === 403) {
-          setIsLoading(false);
-          showToast("Access restricted: This room belongs to another computer system", "error");
-          return;
-        }
-
         if (res.status === 401) {
           setRequiresPinModal(true);
           setIsLoading(false);
@@ -252,12 +246,6 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-
-      if (res.status === 403) {
-        showToast("Access denied: Cannot overwrite another computer's room", "error");
-        setIsSaving(false);
-        return;
-      }
 
       if (res.status === 401) {
         showToast("Incorrect passcode", "error");
