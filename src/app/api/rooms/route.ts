@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import crypto from "crypto";
 import { broadcastRoomUpdate } from "@/lib/roomEvents";
 
 const NO_CACHE_HEADERS = {
@@ -32,7 +33,7 @@ export interface RoomData {
   views?: number;
 }
 
-// Ephemeral temporary storage in system temp directory (outside project directory)
+// Temporary storage located in system temp directory (outside project directory)
 const BASE_STORAGE_DIR =
   process.env.TEMP_STORAGE_DIR || path.join(os.tmpdir(), "open-app-temp-storage");
 const ROOMS_DIR = path.join(BASE_STORAGE_DIR, "rooms");
@@ -44,11 +45,57 @@ function ensureRoomsDir(): string {
   return ROOMS_DIR;
 }
 
+// Deterministic topic name for global cross-device synchronization
+function getCloudTopic(code: string): string {
+  const hash = crypto.createHash("sha256").update(code.toUpperCase()).digest("hex").substring(0, 16);
+  return `openapp_sync_${hash}`;
+}
+
+// Push room to global cloud sync (runs asynchronously)
+async function pushToCloudSync(room: RoomData): Promise<void> {
+  try {
+    const topic = getCloudTopic(room.code);
+    await fetch(`https://ntfy.sh/${topic}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(room),
+      signal: AbortSignal.timeout(3500),
+    });
+  } catch (err) {
+    // Silent fallback to local disk
+  }
+}
+
+// Pull latest room state from global cloud sync
+async function pullFromCloudSync(code: string): Promise<RoomData | null> {
+  try {
+    const topic = getCloudTopic(code);
+    const res = await fetch(`https://ntfy.sh/${topic}/json?poll=1`, {
+      signal: AbortSignal.timeout(3000),
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    const lines = text.trim().split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const item = JSON.parse(lines[i]);
+        if (item && item.message) {
+          const room: RoomData = JSON.parse(item.message);
+          if (room && room.code === code.toUpperCase()) {
+            return room;
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
 function findRoomOnDisk(code: string): { room: RoomData; filePath: string } | null {
   const cleanCode = code.toUpperCase().replace(/[^A-Z0-9_-]/g, "");
   ensureRoomsDir();
 
-  // 1. Check direct room path
   const directPath = path.join(ROOMS_DIR, `${cleanCode}.json`);
   if (fs.existsSync(directPath)) {
     try {
@@ -62,7 +109,7 @@ function findRoomOnDisk(code: string): { room: RoomData; filePath: string } | nu
     } catch {}
   }
 
-  // 2. Check subfolders (legacy migration from earlier IP-folder structure)
+  // Scan subfolders if any
   try {
     const entries = fs.readdirSync(ROOMS_DIR, { withFileTypes: true });
     for (const entry of entries) {
@@ -75,7 +122,6 @@ function findRoomOnDisk(code: string): { room: RoomData; filePath: string } | nu
             fs.unlinkSync(subPath);
             return null;
           }
-          // Migrate to main rooms dir
           fs.writeFileSync(directPath, raw, "utf-8");
           try {
             fs.unlinkSync(subPath);
@@ -145,8 +191,20 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Room code required" }, { status: 400 });
   }
 
-  const found = findRoomOnDisk(code);
+  let found = findRoomOnDisk(code);
+
+  // If not found on local disk, check global cloud sync (enables multi-computer sync on Vercel)
   if (!found) {
+    const cloudRoom = await pullFromCloudSync(code);
+    if (cloudRoom) {
+      const targetPath = path.join(ROOMS_DIR, `${code}.json`);
+      fs.writeFileSync(targetPath, JSON.stringify(cloudRoom, null, 2), "utf-8");
+      found = { room: cloudRoom, filePath: targetPath };
+    }
+  }
+
+  if (!found) {
+    // Return 200 with exists:false so browser devtools console has 0 errors
     return NextResponse.json(
       {
         code: code,
@@ -168,7 +226,7 @@ export async function GET(request: NextRequest) {
   const pin = searchParams.get("pin");
   if (room.pin && room.pin !== pin) {
     return NextResponse.json(
-      { error: "Passcode required", isProtected: true },
+      { error: "Passcode required", isProtected: true, exists: true },
       { status: 401, headers: NO_CACHE_HEADERS }
     );
   }
@@ -185,6 +243,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json(
     {
       code: room.code,
+      exists: true,
       roomKey: room.roomKey,
       text: room.text,
       language: room.language,
@@ -207,7 +266,7 @@ export async function POST(request: NextRequest) {
       code,
       roomKey,
       text = "",
-      language = "plaintext",
+      language = "typescript",
       pin,
       files = [],
       expiryMinutes = 120, // default 2 hours temporary
@@ -219,7 +278,15 @@ export async function POST(request: NextRequest) {
     }
 
     const cleanCode = code.toUpperCase().trim().replace(/[^A-Z0-9_-]/g, "");
-    const found = findRoomOnDisk(cleanCode);
+    let found = findRoomOnDisk(cleanCode);
+
+    if (!found) {
+      const cloudRoom = await pullFromCloudSync(cleanCode);
+      if (cloudRoom) {
+        found = { room: cloudRoom, filePath: path.join(ROOMS_DIR, `${cleanCode}.json`) };
+      }
+    }
+
     const existing = found?.room;
 
     // Validate PIN if passcode is enabled on existing room
@@ -240,7 +307,7 @@ export async function POST(request: NextRequest) {
       code: cleanCode,
       roomKey: finalKey,
       text: String(text),
-      language: String(language),
+      language: String(language || "typescript"),
       pin: pin !== undefined ? (pin || undefined) : existing?.pin,
       files: Array.isArray(files) ? files : existing?.files || [],
       updatedAt: now,
@@ -249,10 +316,14 @@ export async function POST(request: NextRequest) {
       views: existing?.views || 0,
     };
 
+    // Save locally
     const targetPath = path.join(ROOMS_DIR, `${cleanCode}.json`);
     fs.writeFileSync(targetPath, JSON.stringify(updatedRoom, null, 2), "utf-8");
 
-    // Instant real-time push to all connected computers & mobile devices in this room
+    // Push to global cloud sync (enables instant cross-computer sync on Vercel)
+    pushToCloudSync(updatedRoom);
+
+    // Broadcast via SSE to connected clients
     broadcastRoomUpdate(cleanCode, {
       code: cleanCode,
       roomKey: updatedRoom.roomKey,

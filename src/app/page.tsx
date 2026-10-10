@@ -21,6 +21,7 @@ import {
   HardDrive,
   Wifi,
   Laptop,
+  Loader2,
 } from "lucide-react";
 
 import { ClipboardFile } from "./api/rooms/route";
@@ -96,10 +97,12 @@ export default function Home() {
   const [showSecurityModal, setShowSecurityModal] = useState<boolean>(false);
   const [copiedSuccess, setCopiedSuccess] = useState<boolean>(false);
   const [showPasteModal, setShowPasteModal] = useState<boolean>(false);
+  const [isJoining, setIsJoining] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
+  const autoSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Toast feedback
   const showToast = useCallback((text: string, type: "success" | "error" | "info" = "info") => {
@@ -125,8 +128,8 @@ export default function Home() {
     } catch {}
   }, []);
 
-  // Generate random room code
-  const generateRandomCode = () => {
+  // Generate random room code & register immediately on server so other devices can join
+  const generateRandomCode = async () => {
     const res = createRandomRoomCode();
     setRoomCode(res);
     setInputCode(res);
@@ -136,14 +139,15 @@ export default function Home() {
       const newUrl = `${window.location.pathname}?code=${encodeURIComponent(res)}`;
       window.history.replaceState(null, "", newUrl);
     }
-    fetchRoom(res);
-    showToast(`New room: ${res}`, "info");
+    // Pre-register on server/cloud so other computers/mobiles find it immediately
+    await saveRoom("", [], res, true);
+    showToast(`Created room: ${res}`, "success");
   };
 
   // Pull room data with IP/System verification & localStorage caching
   const fetchRoom = useCallback(
-    async (codeToFetch: string, pinToUse: string = roomPin, keyToUse?: string) => {
-      if (!codeToFetch) return;
+    async (codeToFetch: string, pinToUse: string = roomPin, keyToUse?: string, isUserAction: boolean = false) => {
+      if (!codeToFetch) return false;
       setIsLoading(true);
       try {
         const storedKey =
@@ -165,19 +169,8 @@ export default function Home() {
         if (res.status === 401) {
           setRequiresPinModal(true);
           setIsLoading(false);
-          showToast("Passcode required for room", "error");
-          return;
-        }
-
-        if (res.status === 404) {
-          setRequiresPinModal(false);
-          setIsLoading(false);
-          // Restore draft from local storage if available on this system
-          if (typeof window !== "undefined") {
-            const localDraft = localStorage.getItem(`system_draft_${codeToFetch}`);
-            if (localDraft) setText(localDraft);
-          }
-          return;
+          showToast(`Passcode required for room ${codeToFetch}`, "error");
+          return false;
         }
 
         if (res.status === 410) {
@@ -186,18 +179,22 @@ export default function Home() {
           setFiles([]);
           setIsLoading(false);
           fetchHostRooms();
-          return;
+          return false;
         }
 
         if (res.ok) {
           const data = await res.json();
           if (data.isNew || data.exists === false) {
             setRequiresPinModal(false);
-            if (typeof window !== "undefined") {
+            if (isUserAction) {
+              setText("");
+              setFiles([]);
+              showToast(`Connected to room ${codeToFetch} (empty room ready)`, "info");
+            } else if (typeof window !== "undefined") {
               const localDraft = localStorage.getItem(`system_draft_${codeToFetch}`);
               if (localDraft && !text) setText(localDraft);
             }
-            return;
+            return true;
           }
 
           setText(data.text || "");
@@ -213,20 +210,34 @@ export default function Home() {
           if (data.updatedAt) {
             setLastSavedTime(new Date(data.updatedAt));
           }
+
+          if (isUserAction) {
+            const lineCount = (data.text || "").split("\n").length;
+            showToast(`Connected to room ${codeToFetch} (${lineCount} lines synced)`, "success");
+          }
+          return true;
         }
+        return false;
       } catch (err: any) {
-        showToast("Error: " + err.message, "error");
+        showToast("Error connecting to room: " + err.message, "error");
+        return false;
       } finally {
         setIsLoading(false);
       }
     },
-    [roomPin, roomKey, showToast, fetchHostRooms]
+    [roomPin, roomKey, text, showToast, fetchHostRooms]
   );
 
-  // Save / push room data (persists to temporary host storage & client localStorage)
-  const saveRoom = async (overrideText?: string, overrideFiles?: ClipboardFile[]) => {
-    if (!roomCode) {
-      showToast("Room code cannot be empty", "error");
+  // Save / push room data (persists to host storage, cloud sync & client localStorage)
+  const saveRoom = async (
+    overrideText?: string,
+    overrideFiles?: ClipboardFile[],
+    overrideCode?: string,
+    silent: boolean = false
+  ) => {
+    const targetRoomCode = overrideCode || roomCode;
+    if (!targetRoomCode) {
+      if (!silent) showToast("Room code cannot be empty", "error");
       return;
     }
 
@@ -236,11 +247,11 @@ export default function Home() {
       const currentStoredKey =
         roomKey ||
         (typeof window !== "undefined"
-          ? localStorage.getItem(`system_key_${roomCode}`) || undefined
+          ? localStorage.getItem(`system_key_${targetRoomCode}`) || undefined
           : undefined);
 
       const payload = {
-        code: roomCode,
+        code: targetRoomCode,
         roomKey: currentStoredKey,
         text: activeText,
         language: language,
@@ -268,39 +279,69 @@ export default function Home() {
       if (data.roomKey) {
         setRoomKey(data.roomKey);
         try {
-          localStorage.setItem(`system_key_${roomCode}`, data.roomKey);
+          localStorage.setItem(`system_key_${targetRoomCode}`, data.roomKey);
         } catch {}
       }
 
       // Save to client-side localStorage
       try {
-        localStorage.setItem(`system_draft_${roomCode}`, activeText);
+        localStorage.setItem(`system_draft_${targetRoomCode}`, activeText);
         const myRooms = JSON.parse(localStorage.getItem("system_my_rooms") || "[]");
-        if (!myRooms.includes(roomCode)) {
-          localStorage.setItem("system_my_rooms", JSON.stringify([roomCode, ...myRooms].slice(0, 20)));
+        if (!myRooms.includes(targetRoomCode)) {
+          localStorage.setItem("system_my_rooms", JSON.stringify([targetRoomCode, ...myRooms].slice(0, 20)));
         }
       } catch {}
 
       setLastSavedTime(new Date());
       fetchHostRooms();
-      showToast(`Saved (${roomCode})`, "success");
+      if (!silent) {
+        showToast(`Saved (${targetRoomCode})`, "success");
+      }
     } catch (err: any) {
-      showToast("Error saving: " + err.message, "error");
+      if (!silent) {
+        showToast("Error saving: " + err.message, "error");
+      }
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleJoinRoom = (targetCode?: string) => {
+  // Join Room with visual loading indicator & connection feedback
+  const handleJoinRoom = async (targetCode?: string) => {
     const code = (targetCode || inputCode).trim().toUpperCase();
-    if (!code) return;
+    if (!code) {
+      showToast("Please enter a room code", "error");
+      return;
+    }
+    setIsJoining(true);
     setRoomCode(code);
     setInputCode(code);
     if (typeof window !== "undefined") {
       const newUrl = `${window.location.pathname}?code=${encodeURIComponent(code)}`;
       window.history.replaceState(null, "", newUrl);
     }
-    fetchRoom(code);
+    showToast(`Connecting to room ${code}...`, "info");
+    await fetchRoom(code, roomPin, undefined, true);
+    setIsJoining(false);
+    setActiveTab("code");
+  };
+
+  // Debounced auto-save on typing (pushes changes to server/cloud within 800ms)
+  const handleEditorTextChange = (newVal: string) => {
+    setText(newVal);
+    try {
+      localStorage.setItem(`system_draft_${roomCode}`, newVal);
+    } catch {}
+
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+    }
+
+    if (roomCode) {
+      autoSaveTimerRef.current = setTimeout(() => {
+        saveRoom(newVal, undefined, roomCode, true);
+      }, 800);
+    }
   };
 
   const handleDeleteRoom = async (codeToDelete: string) => {
@@ -695,10 +736,13 @@ export default function Home() {
             />
             <button
               onClick={() => handleJoinRoom()}
+              disabled={isJoining}
               className="btn btn-secondary btn-sm"
               title="Open room"
+              style={{ minWidth: "64px" }}
             >
-              Join
+              {isJoining ? <Loader2 size={12} className="animate-spin" /> : null}
+              {isJoining ? "Joining..." : "Join"}
             </button>
             <button
               onClick={generateRandomCode}
@@ -869,14 +913,9 @@ export default function Home() {
               <textarea
                 ref={textareaRef}
                 className="editor-textarea"
-                placeholder="// Type or paste code here... (Ctrl+S to save)"
+                placeholder="// Type or paste code here... (auto-saved & synced across devices)"
                 value={text}
-                onChange={(e) => {
-                  setText(e.target.value);
-                  try {
-                    localStorage.setItem(`system_draft_${roomCode}`, e.target.value);
-                  } catch {}
-                }}
+                onChange={(e) => handleEditorTextChange(e.target.value)}
                 onScroll={handleEditorScroll}
                 onClick={handleEditorCursor}
                 onKeyUp={handleEditorCursor}
