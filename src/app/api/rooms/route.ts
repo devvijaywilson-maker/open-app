@@ -147,7 +147,19 @@ export async function GET(request: NextRequest) {
 
   const found = findRoomOnDisk(code);
   if (!found) {
-    return NextResponse.json({ error: "Room not found", isNew: true }, { status: 404 });
+    return NextResponse.json(
+      {
+        code: code,
+        exists: false,
+        isNew: true,
+        text: "",
+        language: "typescript",
+        files: [],
+        isProtected: false,
+        updatedAt: null,
+      },
+      { headers: NO_CACHE_HEADERS }
+    );
   }
 
   const { room, filePath } = found;

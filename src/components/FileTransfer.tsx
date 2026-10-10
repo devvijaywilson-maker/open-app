@@ -10,10 +10,10 @@ import {
   Archive,
   Download,
   Trash2,
-  Eye,
   FolderOpen,
   Loader2,
-  HardDrive,
+  CheckCircle2,
+  AlertCircle,
 } from "lucide-react";
 import { ClipboardFile } from "@/app/api/rooms/route";
 
@@ -23,6 +23,8 @@ interface FileTransferProps {
   showToast: (msg: string, type?: "success" | "error" | "info") => void;
 }
 
+const CHUNK_SIZE = 3 * 1024 * 1024; // 3MB chunks (stays safely under Vercel's 4.5MB serverless payload limit)
+
 export const FileTransfer: React.FC<FileTransferProps> = ({
   files,
   onFilesChange,
@@ -30,8 +32,11 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
 }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<string>("");
-  const [previewFile, setPreviewFile] = useState<ClipboardFile | null>(null);
+  const [uploadPercent, setUploadPercent] = useState<number>(0);
+  const [currentFileName, setCurrentFileName] = useState<string>("");
+  const [uploadStats, setUploadStats] = useState<string>("");
+  const [currentFileIndex, setCurrentFileIndex] = useState<number>(1);
+  const [totalFilesToUpload, setTotalFilesToUpload] = useState<number>(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const formatFileSize = (bytes: number) => {
@@ -43,66 +48,154 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
   };
 
   const getFileIcon = (file: ClipboardFile) => {
-    const type = file.type.toLowerCase();
-    const name = file.name.toLowerCase();
-    if (type.includes("image")) return <ImageIcon size={18} />;
-    if (type.includes("zip") || name.endsWith(".zip") || name.endsWith(".rar") || name.endsWith(".7z") || name.endsWith(".tar") || name.endsWith(".gz"))
+    const type = (file.type || "").toLowerCase();
+    const name = (file.name || "").toLowerCase();
+    if (type.includes("image") || name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".svg") || name.endsWith(".webp") || name.endsWith(".gif")) {
+      return <ImageIcon size={18} />;
+    }
+    if (type.includes("zip") || name.endsWith(".zip") || name.endsWith(".rar") || name.endsWith(".7z") || name.endsWith(".tar") || name.endsWith(".gz")) {
       return <Archive size={18} />;
-    if (name.endsWith(".js") || name.endsWith(".ts") || name.endsWith(".py") || name.endsWith(".java") || name.endsWith(".cpp") || name.endsWith(".sql") || name.endsWith(".json") || name.endsWith(".html") || name.endsWith(".css"))
+    }
+    if (name.endsWith(".js") || name.endsWith(".ts") || name.endsWith(".py") || name.endsWith(".java") || name.endsWith(".cpp") || name.endsWith(".sql") || name.endsWith(".json") || name.endsWith(".html") || name.endsWith(".css")) {
       return <FileCode size={18} />;
-    if (type.includes("text") || name.endsWith(".txt") || name.endsWith(".md") || name.endsWith(".log"))
+    }
+    if (type.includes("text") || name.endsWith(".txt") || name.endsWith(".md") || name.endsWith(".log")) {
       return <FileText size={18} />;
+    }
     return <File size={18} />;
   };
 
+  // Upload single file chunk via XMLHttpRequest to accurately track byte progress
+  const uploadChunk = (
+    chunk: Blob,
+    chunkIndex: number,
+    totalChunks: number,
+    fileId: string,
+    fileName: string,
+    fileSize: number,
+    fileType: string,
+    onProgress: (loaded: number) => void
+  ): Promise<{ complete: boolean; file?: ClipboardFile }> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const formData = new FormData();
+
+      formData.append("chunk", chunk);
+      formData.append("chunkIndex", String(chunkIndex));
+      formData.append("totalChunks", String(totalChunks));
+      formData.append("fileId", fileId);
+      formData.append("fileName", fileName);
+      formData.append("fileSize", String(fileSize));
+      formData.append("fileType", fileType);
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          onProgress(e.loaded);
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            const data = JSON.parse(xhr.responseText);
+            resolve(data);
+          } catch (err) {
+            reject(new Error("Invalid server response"));
+          }
+        } else {
+          try {
+            const err = JSON.parse(xhr.responseText);
+            reject(new Error(err.error || `Upload failed with status ${xhr.status}`));
+          } catch {
+            reject(new Error(`Upload failed with status ${xhr.status}`));
+          }
+        }
+      };
+
+      xhr.onerror = () => reject(new Error("Network connection error during upload"));
+      xhr.open("POST", "/api/upload");
+      xhr.send(formData);
+    });
+  };
+
+  // Upload multiple files sequentially with real-time percentage progress bar
   const uploadFiles = async (fileList: FileList | File[]) => {
     if (!fileList || fileList.length === 0) return;
-    setIsUploading(true);
 
+    setIsUploading(true);
+    setTotalFilesToUpload(fileList.length);
     const uploadedNew: ClipboardFile[] = [];
 
     for (let i = 0; i < fileList.length; i++) {
       const file = fileList[i];
+      setCurrentFileIndex(i + 1);
+      setCurrentFileName(file.name);
+      setUploadPercent(0);
 
-      // Check client-side 100MB limit
-      if (file.size > 100 * 1024 * 1024) {
-        showToast(`${file.name} exceeds 100MB limit`, "error");
+      // Validate 100MB limit
+      const MAX_SIZE = 100 * 1024 * 1024;
+      if (file.size > MAX_SIZE) {
+        showToast(`${file.name} exceeds 100MB maximum limit`, "error");
         continue;
       }
 
-      setUploadProgress(`Uploading ${file.name} (${formatFileSize(file.size)})...`);
+      const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+      const fileId = "file_" + Date.now().toString(36) + "_" + Math.random().toString(36).substring(2, 8);
 
-      const formData = new FormData();
-      formData.append("file", file);
+      let isSuccess = false;
+      let finalMeta: ClipboardFile | undefined;
 
       try {
-        const res = await fetch("/api/upload", {
-          method: "POST",
-          body: formData,
-        });
+        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+          const start = chunkIndex * CHUNK_SIZE;
+          const end = Math.min(file.size, start + CHUNK_SIZE);
+          const chunkBlob = file.slice(start, end);
 
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({}));
-          throw new Error(errData.error || "Upload failed");
+          const result = await uploadChunk(
+            chunkBlob,
+            chunkIndex,
+            totalChunks,
+            fileId,
+            file.name,
+            file.size,
+            file.type,
+            (loadedInChunk) => {
+              const totalUploaded = start + loadedInChunk;
+              const percent = Math.min(99, Math.round((totalUploaded / file.size) * 100));
+              setUploadPercent(percent);
+              setUploadStats(`${formatFileSize(totalUploaded)} / ${formatFileSize(file.size)}`);
+            }
+          );
+
+          if (result.complete && result.file) {
+            isSuccess = true;
+            finalMeta = result.file;
+            setUploadPercent(100);
+            setUploadStats(`${formatFileSize(file.size)} / ${formatFileSize(file.size)}`);
+          }
         }
 
-        const data = await res.json();
-        if (data.file) {
-          uploadedNew.push(data.file);
+        if (isSuccess && finalMeta) {
+          uploadedNew.push(finalMeta);
         }
       } catch (err: any) {
-        showToast(`Failed to upload ${file.name}: ${err.message}`, "error");
+        showToast(`Failed uploading ${file.name}: ${err.message}`, "error");
       }
     }
 
     if (uploadedNew.length > 0) {
       const updated = [...files, ...uploadedNew];
       onFilesChange(updated);
-      showToast(`Uploaded ${uploadedNew.length} file(s)`, "success");
+      showToast(`Uploaded ${uploadedNew.length} file(s) successfully`, "success");
     }
 
     setIsUploading(false);
-    setUploadProgress("");
+    setUploadPercent(0);
+    setCurrentFileName("");
+    setUploadStats("");
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -118,7 +211,7 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-    if (e.dataTransfer.files) {
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       uploadFiles(e.dataTransfer.files);
     }
   };
@@ -128,7 +221,9 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
     const a = document.createElement("a");
     a.href = url;
     a.download = file.name;
+    document.body.appendChild(a);
     a.click();
+    document.body.removeChild(a);
     showToast(`Downloading ${file.name}`, "info");
   };
 
@@ -138,45 +233,107 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
     } catch {}
     const updated = files.filter((f) => f.id !== id);
     onFilesChange(updated);
-    showToast("File deleted", "info");
+    showToast("File removed", "info");
   };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
-      {/* Upload Zone (Supports 100MB) */}
+      {/* Upload Dropzone */}
       <div
         className={`dropzone ${isDragging ? "active" : ""}`}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
-        onClick={() => fileInputRef.current?.click()}
+        onClick={() => {
+          if (!isUploading) {
+            fileInputRef.current?.click();
+          }
+        }}
+        style={{ cursor: isUploading ? "wait" : "pointer" }}
       >
         <input
           type="file"
           ref={fileInputRef}
           style={{ display: "none" }}
           multiple
-          onChange={(e) => e.target.files && uploadFiles(e.target.files)}
+          onChange={(e) => {
+            if (e.target.files && e.target.files.length > 0) {
+              uploadFiles(e.target.files);
+            }
+          }}
         />
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "8px" }}>
+
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px", width: "100%", maxWidth: "440px", margin: "0 auto" }}>
           {isUploading ? (
-            <Loader2 size={28} className="animate-spin" />
+            <Loader2 size={32} className="animate-spin" />
           ) : (
-            <UploadCloud size={30} />
+            <UploadCloud size={34} />
           )}
-          <div style={{ fontSize: "0.92rem", fontWeight: 600 }}>
-            {isUploading ? uploadProgress || "Uploading..." : "Drop files here or click to upload"}
-          </div>
-          <div style={{ fontSize: "0.78rem", color: "var(--text-muted)" }}>
-            Up to <strong>100MB per file</strong> (scripts, archives, images, documents)
-          </div>
-          <button className="btn btn-secondary btn-sm" style={{ marginTop: "4px" }}>
-            <FolderOpen size={13} /> Select Files
-          </button>
+
+          {/* Upload Text or Progress Bar */}
+          {isUploading ? (
+            <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: "6px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.85rem", fontWeight: 600 }}>
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "260px" }}>
+                  {totalFilesToUpload > 1 ? `(${currentFileIndex}/${totalFilesToUpload}) ` : ""}
+                  {currentFileName}
+                </span>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: "0.9rem" }}>
+                  {uploadPercent}%
+                </span>
+              </div>
+
+              {/* Real-time Progress Bar */}
+              <div
+                style={{
+                  width: "100%",
+                  height: "8px",
+                  backgroundColor: "var(--card-border)",
+                  borderRadius: "9999px",
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  style={{
+                    height: "100%",
+                    width: `${uploadPercent}%`,
+                    backgroundColor: "var(--foreground)",
+                    borderRadius: "9999px",
+                    transition: "width 0.15s ease",
+                  }}
+                />
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.74rem", color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>
+                <span>Uploading...</span>
+                <span>{uploadStats}</span>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: "0.92rem", fontWeight: 600 }}>
+                Drop files here or click to upload
+              </div>
+              <div style={{ fontSize: "0.78rem", color: "var(--text-muted)" }}>
+                Supports up to <strong>100MB per file</strong> with real-time chunked transfer
+              </div>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  fileInputRef.current?.click();
+                }}
+                style={{ marginTop: "4px" }}
+              >
+                <FolderOpen size={13} /> Select Files
+              </button>
+            </>
+          )}
         </div>
       </div>
 
-      {/* Files List Table */}
+      {/* Uploaded Files Table */}
       {files.length > 0 && (
         <div className="mono-card" style={{ padding: "14px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
@@ -185,8 +342,10 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
             </div>
             <button
               onClick={() => {
-                onFilesChange([]);
-                showToast("Cleared file references", "info");
+                if (confirm("Clear all attached files from this room?")) {
+                  onFilesChange([]);
+                  showToast("Cleared file references", "info");
+                }
               }}
               className="btn btn-secondary btn-sm"
               style={{ fontSize: "0.75rem" }}

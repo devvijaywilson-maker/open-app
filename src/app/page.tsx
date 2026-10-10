@@ -191,6 +191,15 @@ export default function Home() {
 
         if (res.ok) {
           const data = await res.json();
+          if (data.isNew || data.exists === false) {
+            setRequiresPinModal(false);
+            if (typeof window !== "undefined") {
+              const localDraft = localStorage.getItem(`system_draft_${codeToFetch}`);
+              if (localDraft && !text) setText(localDraft);
+            }
+            return;
+          }
+
           setText(data.text || "");
           if (data.language) setLanguage(data.language);
           if (data.files) setFiles(data.files);
