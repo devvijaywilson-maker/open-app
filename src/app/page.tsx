@@ -28,6 +28,8 @@ import { Toast, ToastMessage } from "@/components/Toast";
 import { QRCodeModal } from "@/components/QRCodeModal";
 import { FileTransfer } from "@/components/FileTransfer";
 import { SecuritySettingsModal } from "@/components/SecuritySettingsModal";
+import { PasteModal } from "@/components/PasteModal";
+import { copyTextToClipboard, readTextFromClipboard } from "@/lib/clipboard";
 
 const SUPPORTED_LANGUAGES = [
   { id: "plaintext", name: "Plain Text", ext: "txt" },
@@ -93,6 +95,7 @@ export default function Home() {
   const [showQRModal, setShowQRModal] = useState<boolean>(false);
   const [showSecurityModal, setShowSecurityModal] = useState<boolean>(false);
   const [copiedSuccess, setCopiedSuccess] = useState<boolean>(false);
+  const [showPasteModal, setShowPasteModal] = useState<boolean>(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -415,40 +418,116 @@ export default function Home() {
     });
   };
 
-  // Copy Code
+  // Copy Code (Zero scroll jump & selection aware)
   const handleCopyCode = async () => {
     if (!text) {
       showToast("Editor is empty", "info");
       return;
     }
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedSuccess(true);
-      const linesCount = text.split("\n").length;
-      showToast(`Copied ${linesCount} lines to clipboard`, "success");
-      setTimeout(() => setCopiedSuccess(false), 2000);
-    } catch {
-      if (textareaRef.current) {
-        textareaRef.current.select();
-        document.execCommand("copy");
-        setCopiedSuccess(true);
-        showToast("Copied to clipboard", "success");
-        setTimeout(() => setCopiedSuccess(false), 2000);
+    const textarea = textareaRef.current;
+    const prevScrollTop = textarea?.scrollTop ?? 0;
+    const prevScrollLeft = textarea?.scrollLeft ?? 0;
+
+    let textToCopy = text;
+    let isSelection = false;
+    if (textarea && textarea.selectionStart !== textarea.selectionEnd) {
+      textToCopy = text.substring(textarea.selectionStart, textarea.selectionEnd);
+      isSelection = true;
+    }
+
+    const success = await copyTextToClipboard(textToCopy);
+
+    // Keep scroll position strictly identical
+    if (textarea) {
+      textarea.scrollTop = prevScrollTop;
+      textarea.scrollLeft = prevScrollLeft;
+      if (gutterRef.current) {
+        gutterRef.current.scrollTop = prevScrollTop;
       }
+    }
+
+    if (success) {
+      setCopiedSuccess(true);
+      const linesCount = textToCopy.split("\n").length;
+      showToast(
+        isSelection ? `Copied ${linesCount} selected lines` : `Copied all ${linesCount} lines to clipboard`,
+        "success"
+      );
+      setTimeout(() => setCopiedSuccess(false), 2000);
+    } else {
+      showToast("Failed to copy to clipboard", "error");
     }
   };
 
-  // Paste Code
-  const handlePasteCode = async () => {
+  // Insert pasted text at cursor (or replace selection) without scroll jump
+  const insertPastedText = (pastedContent: string, replaceAll: boolean = false) => {
+    if (!pastedContent) return;
+    const textarea = textareaRef.current;
+
+    if (replaceAll || !text || !textarea) {
+      setText(pastedContent);
+      try {
+        localStorage.setItem(`system_draft_${roomCode}`, pastedContent);
+      } catch {}
+      showToast(`Pasted ${pastedContent.split("\n").length} lines`, "success");
+      return;
+    }
+
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const prevScrollTop = textarea.scrollTop;
+    const prevScrollLeft = textarea.scrollLeft;
+
+    const newText = text.substring(0, start) + pastedContent + text.substring(end);
+    setText(newText);
     try {
-      const clipboardContent = await navigator.clipboard.readText();
-      if (clipboardContent) {
-        setText(clipboardContent);
-        showToast("Pasted from clipboard", "success");
+      localStorage.setItem(`system_draft_${roomCode}`, newText);
+    } catch {}
+
+    const newCursorPos = start + pastedContent.length;
+    requestAnimationFrame(() => {
+      if (textareaRef.current) {
+        textareaRef.current.scrollTop = prevScrollTop;
+        textareaRef.current.scrollLeft = prevScrollLeft;
+        textareaRef.current.selectionStart = newCursorPos;
+        textareaRef.current.selectionEnd = newCursorPos;
+        if (gutterRef.current) {
+          gutterRef.current.scrollTop = prevScrollTop;
+        }
       }
-    } catch {
-      showToast("Use Ctrl+V / Cmd+V in editor to paste", "info");
-      textareaRef.current?.focus();
+    });
+
+    showToast(`Inserted ${pastedContent.split("\n").length} lines at cursor`, "success");
+  };
+
+  // Paste Code Toolbar button
+  const handlePasteCode = async () => {
+    const res = await readTextFromClipboard();
+    if (res.text) {
+      insertPastedText(res.text, false);
+    } else {
+      setShowPasteModal(true);
+    }
+  };
+
+  // Tab key indentation support in IDE editor
+  const handleEditorKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+
+      const newText = text.substring(0, start) + "  " + text.substring(end);
+      setText(newText);
+      try {
+        localStorage.setItem(`system_draft_${roomCode}`, newText);
+      } catch {}
+
+      requestAnimationFrame(() => {
+        textarea.selectionStart = textarea.selectionEnd = start + 2;
+      });
     }
   };
 
@@ -492,7 +571,7 @@ export default function Home() {
   const currentExt = SUPPORTED_LANGUAGES.find((l) => l.id === language)?.ext || "txt";
 
   return (
-    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "var(--background)" }}>
+    <div className="app-container">
       <Toast toasts={toasts} onDismiss={dismissToast} />
 
       <QRCodeModal
@@ -501,6 +580,12 @@ export default function Home() {
         roomCode={roomCode}
         roomKey={roomKey}
         showToast={showToast}
+      />
+
+      <PasteModal
+        isOpen={showPasteModal}
+        onClose={() => setShowPasteModal(false)}
+        onInsert={insertPastedText}
       />
 
       <SecuritySettingsModal
@@ -578,18 +663,7 @@ export default function Home() {
       )}
 
       {/* Top Header: Next.js Black & White Minimalist Style */}
-      <header
-        style={{
-          borderBottom: "1px solid var(--card-border)",
-          background: "var(--background)",
-          padding: "10px 16px",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          flexWrap: "wrap",
-          gap: "10px",
-        }}
-      >
+      <header className="app-header">
         {/* Left: Tool Name + Room Control */}
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "6px", fontWeight: 700, fontSize: "0.92rem" }}>
@@ -696,10 +770,10 @@ export default function Home() {
       </header>
 
 
-      {/* Main Workspace */}
-      <div style={{ flex: 1, padding: "14px 16px", maxWidth: "1380px", margin: "0 auto", width: "100%" }}>
+      {/* Main Fixed Workspace */}
+      <main className="workspace-main">
         {/* Tab Navigation */}
-        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", borderBottom: "1px solid var(--card-border)", marginBottom: "-1px" }}>
+        <div className="workspace-tabs-bar">
           <div style={{ display: "flex", gap: "2px" }}>
             <button
               onClick={() => setActiveTab("code")}
@@ -783,13 +857,15 @@ export default function Home() {
           )}
         </div>
 
-        {/* TAB 1: Code & Text Editor */}
+        {/* TAB 1: Code & Text Editor (Fixed Height with Internal Scroll View) */}
         {activeTab === "code" && (
-          <div className="mono-card" style={{ overflow: "hidden", borderTopLeftRadius: 0 }}>
+          <div className="mono-card editor-card-container">
             <div className="editor-wrapper">
               <div ref={gutterRef} className="editor-gutter">
                 {lineNumbers.map((num) => (
-                  <div key={num}>{num}</div>
+                  <div key={num} className="editor-gutter-line">
+                    {num}
+                  </div>
                 ))}
               </div>
 
@@ -807,6 +883,7 @@ export default function Home() {
                 onScroll={handleEditorScroll}
                 onClick={handleEditorCursor}
                 onKeyUp={handleEditorCursor}
+                onKeyDown={handleEditorKeyDown}
                 spellCheck={false}
               />
             </div>
@@ -842,7 +919,7 @@ export default function Home() {
 
         {/* TAB 2: File Transfer (100MB) */}
         {activeTab === "files" && (
-          <div style={{ marginTop: "12px" }}>
+          <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "10px 0" }}>
             <FileTransfer
               files={files}
               onFilesChange={(newFiles) => {
@@ -856,7 +933,7 @@ export default function Home() {
 
         {/* TAB 3: Host Storage Rooms List */}
         {activeTab === "rooms" && (
-          <div className="mono-card" style={{ padding: "18px", marginTop: "12px" }}>
+          <div className="mono-card" style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "18px", marginTop: "10px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px", flexWrap: "wrap", gap: "10px" }}>
               <div>
                 <h3 style={{ fontSize: "0.95rem", fontWeight: 700 }}>Host Storage Rooms</h3>
@@ -932,7 +1009,7 @@ export default function Home() {
             )}
           </div>
         )}
-      </div>
+      </main>
     </div>
   );
 }

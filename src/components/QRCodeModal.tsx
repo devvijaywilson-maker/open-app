@@ -4,6 +4,8 @@ import React, { useState, useEffect } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { X, Copy, Check, Smartphone, ExternalLink } from "lucide-react";
 
+import { copyTextToClipboard } from "@/lib/clipboard";
+
 interface QRCodeModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -55,12 +57,12 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({
   const shareUrl = `${currentOrigin}?code=${encodeURIComponent(roomCode)}${keyParam}`;
 
   const handleCopyLink = async () => {
-    try {
-      await navigator.clipboard.writeText(shareUrl);
+    const success = await copyTextToClipboard(shareUrl);
+    if (success) {
       setCopied(true);
       showToast("Link copied", "success");
       setTimeout(() => setCopied(false), 2000);
-    } catch {
+    } else {
       showToast("Failed to copy link", "error");
     }
   };
