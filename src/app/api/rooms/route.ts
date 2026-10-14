@@ -7,8 +7,8 @@ import { broadcastRoomUpdate } from "@/lib/roomEvents";
 
 const NO_CACHE_HEADERS = {
   "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
-  "Pragma": "no-cache",
-  "Expires": "0",
+  Pragma: "no-cache",
+  Expires: "0",
 };
 
 export interface ClipboardFile {
@@ -17,6 +17,8 @@ export interface ClipboardFile {
   size: number;
   type: string;
   uploadedAt: number;
+  // Blob pathname (never a public URL) — private blobs are streamed via /api/upload.
+  pathname?: string;
 }
 
 export interface RoomData {
@@ -35,7 +37,8 @@ export interface RoomData {
 
 // Temporary storage located in system temp directory (outside project directory)
 const BASE_STORAGE_DIR =
-  process.env.TEMP_STORAGE_DIR || path.join(os.tmpdir(), "open-app-temp-storage");
+  process.env.TEMP_STORAGE_DIR ||
+  path.join(os.tmpdir(), "open-app-temp-storage");
 const ROOMS_DIR = path.join(BASE_STORAGE_DIR, "rooms");
 
 function ensureRoomsDir(): string {
@@ -47,7 +50,11 @@ function ensureRoomsDir(): string {
 
 // Deterministic topic name for global cross-device synchronization
 function getCloudTopic(code: string): string {
-  const hash = crypto.createHash("sha256").update(code.toUpperCase()).digest("hex").substring(0, 16);
+  const hash = crypto
+    .createHash("sha256")
+    .update(code.toUpperCase())
+    .digest("hex")
+    .substring(0, 16);
   return `openapp_sync_${hash}`;
 }
 
@@ -92,7 +99,9 @@ async function pullFromCloudSync(code: string): Promise<RoomData | null> {
   return null;
 }
 
-function findRoomOnDisk(code: string): { room: RoomData; filePath: string } | null {
+function findRoomOnDisk(
+  code: string,
+): { room: RoomData; filePath: string } | null {
   const cleanCode = code.toUpperCase().replace(/[^A-Z0-9_-]/g, "");
   ensureRoomsDir();
 
@@ -182,7 +191,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(
       { rooms: roomsList.sort((a, b) => b.updatedAt - a.updatedAt) },
-      { headers: NO_CACHE_HEADERS }
+      { headers: NO_CACHE_HEADERS },
     );
   }
 
@@ -216,7 +225,7 @@ export async function GET(request: NextRequest) {
         isProtected: false,
         updatedAt: null,
       },
-      { headers: NO_CACHE_HEADERS }
+      { headers: NO_CACHE_HEADERS },
     );
   }
 
@@ -227,14 +236,17 @@ export async function GET(request: NextRequest) {
   if (room.pin && room.pin !== pin) {
     return NextResponse.json(
       { error: "Passcode required", isProtected: true, exists: true },
-      { status: 401, headers: NO_CACHE_HEADERS }
+      { status: 401, headers: NO_CACHE_HEADERS },
     );
   }
 
   // Handle self-destruct (burn after reading)
   if (room.selfDestruct && room.views && room.views >= 1) {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    return NextResponse.json({ error: "Room self-destructed." }, { status: 410, headers: NO_CACHE_HEADERS });
+    return NextResponse.json(
+      { error: "Room self-destructed." },
+      { status: 410, headers: NO_CACHE_HEADERS },
+    );
   }
 
   room.views = (room.views || 0) + 1;
@@ -254,7 +266,7 @@ export async function GET(request: NextRequest) {
       selfDestruct: room.selfDestruct,
       views: room.views,
     },
-    { headers: NO_CACHE_HEADERS }
+    { headers: NO_CACHE_HEADERS },
   );
 }
 
@@ -277,13 +289,19 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid room code" }, { status: 400 });
     }
 
-    const cleanCode = code.toUpperCase().trim().replace(/[^A-Z0-9_-]/g, "");
+    const cleanCode = code
+      .toUpperCase()
+      .trim()
+      .replace(/[^A-Z0-9_-]/g, "");
     let found = findRoomOnDisk(cleanCode);
 
     if (!found) {
       const cloudRoom = await pullFromCloudSync(cleanCode);
       if (cloudRoom) {
-        found = { room: cloudRoom, filePath: path.join(ROOMS_DIR, `${cleanCode}.json`) };
+        found = {
+          room: cloudRoom,
+          filePath: path.join(ROOMS_DIR, `${cleanCode}.json`),
+        };
       }
     }
 
@@ -291,7 +309,10 @@ export async function POST(request: NextRequest) {
 
     // Validate PIN if passcode is enabled on existing room
     if (existing?.pin && existing.pin !== pin) {
-      return NextResponse.json({ error: "Invalid passcode" }, { status: 401, headers: NO_CACHE_HEADERS });
+      return NextResponse.json(
+        { error: "Invalid passcode" },
+        { status: 401, headers: NO_CACHE_HEADERS },
+      );
     }
 
     const now = Date.now();
@@ -301,14 +322,16 @@ export async function POST(request: NextRequest) {
     }
 
     const finalKey =
-      existing?.roomKey || roomKey || Math.random().toString(36).substring(2, 12);
+      existing?.roomKey ||
+      roomKey ||
+      Math.random().toString(36).substring(2, 12);
 
     const updatedRoom: RoomData = {
       code: cleanCode,
       roomKey: finalKey,
       text: String(text),
       language: String(language || "typescript"),
-      pin: pin !== undefined ? (pin || undefined) : existing?.pin,
+      pin: pin !== undefined ? pin || undefined : existing?.pin,
       files: Array.isArray(files) ? files : existing?.files || [],
       updatedAt: now,
       expiresAt: expiresAt,
@@ -343,10 +366,13 @@ export async function POST(request: NextRequest) {
         expiresAt: updatedRoom.expiresAt,
         fileCount: updatedRoom.files.length,
       },
-      { headers: NO_CACHE_HEADERS }
+      { headers: NO_CACHE_HEADERS },
     );
   } catch (err: any) {
-    return NextResponse.json({ error: "Failed to save room: " + err.message }, { status: 500 });
+    return NextResponse.json(
+      { error: "Failed to save room: " + err.message },
+      { status: 500 },
+    );
   }
 }
 
@@ -364,5 +390,8 @@ export async function DELETE(request: NextRequest) {
     fs.unlinkSync(found.filePath);
   }
 
-  return NextResponse.json({ success: true, message: `Room ${cleanCode} deleted` }, { headers: NO_CACHE_HEADERS });
+  return NextResponse.json(
+    { success: true, message: `Room ${cleanCode} deleted` },
+    { headers: NO_CACHE_HEADERS },
+  );
 }

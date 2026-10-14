@@ -50,16 +50,46 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
   const getFileIcon = (file: ClipboardFile) => {
     const type = (file.type || "").toLowerCase();
     const name = (file.name || "").toLowerCase();
-    if (type.includes("image") || name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".svg") || name.endsWith(".webp") || name.endsWith(".gif")) {
+    if (
+      type.includes("image") ||
+      name.endsWith(".png") ||
+      name.endsWith(".jpg") ||
+      name.endsWith(".jpeg") ||
+      name.endsWith(".svg") ||
+      name.endsWith(".webp") ||
+      name.endsWith(".gif")
+    ) {
       return <ImageIcon size={18} />;
     }
-    if (type.includes("zip") || name.endsWith(".zip") || name.endsWith(".rar") || name.endsWith(".7z") || name.endsWith(".tar") || name.endsWith(".gz")) {
+    if (
+      type.includes("zip") ||
+      name.endsWith(".zip") ||
+      name.endsWith(".rar") ||
+      name.endsWith(".7z") ||
+      name.endsWith(".tar") ||
+      name.endsWith(".gz")
+    ) {
       return <Archive size={18} />;
     }
-    if (name.endsWith(".js") || name.endsWith(".ts") || name.endsWith(".py") || name.endsWith(".java") || name.endsWith(".cpp") || name.endsWith(".sql") || name.endsWith(".json") || name.endsWith(".html") || name.endsWith(".css")) {
+    if (
+      name.endsWith(".js") ||
+      name.endsWith(".ts") ||
+      name.endsWith(".py") ||
+      name.endsWith(".java") ||
+      name.endsWith(".cpp") ||
+      name.endsWith(".sql") ||
+      name.endsWith(".json") ||
+      name.endsWith(".html") ||
+      name.endsWith(".css")
+    ) {
       return <FileCode size={18} />;
     }
-    if (type.includes("text") || name.endsWith(".txt") || name.endsWith(".md") || name.endsWith(".log")) {
+    if (
+      type.includes("text") ||
+      name.endsWith(".txt") ||
+      name.endsWith(".md") ||
+      name.endsWith(".log")
+    ) {
       return <FileText size={18} />;
     }
     return <File size={18} />;
@@ -74,7 +104,7 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
     fileName: string,
     fileSize: number,
     fileType: string,
-    onProgress: (loaded: number) => void
+    onProgress: (loaded: number) => void,
   ): Promise<{ complete: boolean; file?: ClipboardFile }> => {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -105,14 +135,17 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
         } else {
           try {
             const err = JSON.parse(xhr.responseText);
-            reject(new Error(err.error || `Upload failed with status ${xhr.status}`));
+            reject(
+              new Error(err.error || `Upload failed with status ${xhr.status}`),
+            );
           } catch {
             reject(new Error(`Upload failed with status ${xhr.status}`));
           }
         }
       };
 
-      xhr.onerror = () => reject(new Error("Network connection error during upload"));
+      xhr.onerror = () =>
+        reject(new Error("Network connection error during upload"));
       xhr.open("POST", "/api/upload");
       xhr.send(formData);
     });
@@ -140,7 +173,11 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
       }
 
       const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
-      const fileId = "file_" + Date.now().toString(36) + "_" + Math.random().toString(36).substring(2, 8);
+      const fileId =
+        "file_" +
+        Date.now().toString(36) +
+        "_" +
+        Math.random().toString(36).substring(2, 8);
 
       let isSuccess = false;
       let finalMeta: ClipboardFile | undefined;
@@ -161,17 +198,24 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
             file.type,
             (loadedInChunk) => {
               const totalUploaded = start + loadedInChunk;
-              const percent = Math.min(99, Math.round((totalUploaded / file.size) * 100));
+              const percent = Math.min(
+                99,
+                Math.round((totalUploaded / file.size) * 100),
+              );
               setUploadPercent(percent);
-              setUploadStats(`${formatFileSize(totalUploaded)} / ${formatFileSize(file.size)}`);
-            }
+              setUploadStats(
+                `${formatFileSize(totalUploaded)} / ${formatFileSize(file.size)}`,
+              );
+            },
           );
 
           if (result.complete && result.file) {
             isSuccess = true;
             finalMeta = result.file;
             setUploadPercent(100);
-            setUploadStats(`${formatFileSize(file.size)} / ${formatFileSize(file.size)}`);
+            setUploadStats(
+              `${formatFileSize(file.size)} / ${formatFileSize(file.size)}`,
+            );
           }
         }
 
@@ -186,7 +230,10 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
     if (uploadedNew.length > 0) {
       const updated = [...files, ...uploadedNew];
       onFilesChange(updated);
-      showToast(`Uploaded ${uploadedNew.length} file(s) successfully`, "success");
+      showToast(
+        `Uploaded ${uploadedNew.length} file(s) successfully`,
+        "success",
+      );
     }
 
     setIsUploading(false);
@@ -217,9 +264,15 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
   };
 
   const handleDownload = (file: ClipboardFile) => {
-    const url = `/api/upload?fileId=${encodeURIComponent(file.id)}`;
+    // Blobs are private, so content is streamed through the API route. The browser never
+    // receives a blob URL and the read-write token never leaves the server.
+    const params = new URLSearchParams({ fileId: file.id });
+    if (file.pathname) {
+      params.set("pathname", file.pathname);
+    }
+
     const a = document.createElement("a");
-    a.href = url;
+    a.href = `/api/upload?${params.toString()}`;
     a.download = file.name;
     document.body.appendChild(a);
     a.click();
@@ -229,7 +282,8 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
 
   const handleDelete = async (id: string) => {
     try {
-      await fetch(`/api/upload?fileId=${encodeURIComponent(id)}`, { method: "DELETE" });
+      const params = new URLSearchParams({ fileId: id });
+      await fetch(`/api/upload?${params.toString()}`, { method: "DELETE" });
     } catch {}
     const updated = files.filter((f) => f.id !== id);
     onFilesChange(updated);
@@ -263,7 +317,17 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
           }}
         />
 
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px", width: "100%", maxWidth: "440px", margin: "0 auto" }}>
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: "10px",
+            width: "100%",
+            maxWidth: "440px",
+            margin: "0 auto",
+          }}
+        >
           {isUploading ? (
             <Loader2 size={32} className="animate-spin" />
           ) : (
@@ -272,13 +336,39 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
 
           {/* Upload Text or Progress Bar */}
           {isUploading ? (
-            <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: "6px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.85rem", fontWeight: 600 }}>
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "260px" }}>
-                  {totalFilesToUpload > 1 ? `(${currentFileIndex}/${totalFilesToUpload}) ` : ""}
+            <div
+              style={{
+                width: "100%",
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  fontSize: "0.85rem",
+                  fontWeight: 600,
+                }}
+              >
+                <span
+                  style={{
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    maxWidth: "260px",
+                  }}
+                >
+                  {totalFilesToUpload > 1
+                    ? `(${currentFileIndex}/${totalFilesToUpload}) `
+                    : ""}
                   {currentFileName}
                 </span>
-                <span style={{ fontFamily: "var(--font-mono)", fontSize: "0.9rem" }}>
+                <span
+                  style={{ fontFamily: "var(--font-mono)", fontSize: "0.9rem" }}
+                >
                   {uploadPercent}%
                 </span>
               </div>
@@ -304,7 +394,15 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
                 />
               </div>
 
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.74rem", color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  fontSize: "0.74rem",
+                  color: "var(--text-muted)",
+                  fontFamily: "var(--font-mono)",
+                }}
+              >
                 <span>Uploading...</span>
                 <span>{uploadStats}</span>
               </div>
@@ -315,7 +413,8 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
                 Drop files here or click to upload
               </div>
               <div style={{ fontSize: "0.78rem", color: "var(--text-muted)" }}>
-                Supports up to <strong>100MB per file</strong> with real-time chunked transfer
+                Supports up to <strong>100MB per file</strong> with real-time
+                chunked transfer
               </div>
               <button
                 type="button"
@@ -336,8 +435,23 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
       {/* Uploaded Files Table */}
       {files.length > 0 && (
         <div className="mono-card" style={{ padding: "14px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-            <div style={{ fontSize: "0.85rem", fontWeight: 600, display: "flex", alignItems: "center", gap: "6px" }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              marginBottom: "12px",
+            }}
+          >
+            <div
+              style={{
+                fontSize: "0.85rem",
+                fontWeight: 600,
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
               <FolderOpen size={15} /> Attached Files ({files.length})
             </div>
             <button
@@ -370,19 +484,50 @@ export const FileTransfer: React.FC<FileTransferProps> = ({
                   gap: "10px",
                 }}
               >
-                <div style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0, flex: 1 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "10px",
+                    minWidth: 0,
+                    flex: 1,
+                  }}
+                >
                   <div style={{ flexShrink: 0 }}>{getFileIcon(file)}</div>
                   <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: "0.84rem", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    <div
+                      style={{
+                        fontSize: "0.84rem",
+                        fontWeight: 600,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
                       {file.name}
                     </div>
-                    <div style={{ fontSize: "0.74rem", color: "var(--text-muted)" }}>
-                      {formatFileSize(file.size)} • {new Date(file.uploadedAt || Date.now()).toLocaleTimeString()}
+                    <div
+                      style={{
+                        fontSize: "0.74rem",
+                        color: "var(--text-muted)",
+                      }}
+                    >
+                      {formatFileSize(file.size)} •{" "}
+                      {new Date(
+                        file.uploadedAt || Date.now(),
+                      ).toLocaleTimeString()}
                     </div>
                   </div>
                 </div>
 
-                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexShrink: 0,
+                  }}
+                >
                   <button
                     onClick={() => handleDownload(file)}
                     className="btn btn-primary btn-sm"
