@@ -1,17 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { put, del, list, get } from "@vercel/blob";
+import fs from "fs";
+import path from "path";
+import os from "os";
 
 // 100MB limit
 const MAX_SIZE = 100 * 1024 * 1024;
 
-// Private blobs live on `<storeId>.private.blob.vercel-storage.com` and every read
-// requires `authorization: Bearer <BLOB_READ_WRITE_TOKEN>`. The token is resolved
-// server-side by the SDK, so blob content must always be streamed through this
-// route — raw URLs are never handed to the browser.
-const BLOB_ACCESS = "private" as const;
+// Use a persistent temp directory inside os.tmpdir() for the lifetime of the process
+const UPLOAD_DIR = path.join(os.tmpdir(), "open-app-uploads");
 
-// The blob pathname is the only handle that addresses content in the store, so it is
-// treated as a security boundary: no path separators, no traversal, no control chars.
+function ensureDir(dirPath: string) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+}
+
 function sanitizeFileName(name: string): string {
   const base = (name.split(/[/\\]/).pop() || "").replace(
     /[\u0000-\u001f\u007f]/g,
@@ -20,47 +23,8 @@ function sanitizeFileName(name: string): string {
   return base.replace(/^\.+/, "").trim().slice(0, 200) || "file";
 }
 
-// Reads a private blob fully into memory. Used for chunk reassembly, where the parts
-// must be concatenated before uploading the final object.
-async function readBlobBuffer(pathname: string): Promise<Buffer> {
-  const result = await get(pathname, { access: BLOB_ACCESS });
-  if (!result || !result.stream) {
-    throw new Error(`blob not found: ${pathname}`);
-  }
-  const arrayBuffer = await new Response(
-    result.stream as unknown as ReadableStream,
-  ).arrayBuffer();
-  return Buffer.from(arrayBuffer);
-}
-
-// Reads a blob for streaming to the client. Blobs uploaded before this route switched to
-// private access live on the public host, so a failed private read falls back to public.
-// Callers must validate the pathname prefix first — this helper does not.
-async function readBlobForDownload(pathname: string) {
-  try {
-    const privateRead = await get(pathname, { access: BLOB_ACCESS });
-    if (privateRead && privateRead.stream) {
-      return privateRead;
-    }
-  } catch {
-    // Fall through to the legacy public read.
-  }
-
-  try {
-    const publicRead = await get(pathname, { access: "public" });
-    if (publicRead && publicRead.stream) {
-      return publicRead;
-    }
-  } catch {
-    // Unreadable either way.
-  }
-
-  return null;
-}
-
-// Quotes and control characters would break the Content-Disposition header.
 function escapeFileName(name: string): string {
-  return name.replace(/["\\\r\n]/g, "_") || "file";
+  return name.replace(/["\\\\\\r\\n]/g, "_") || "file";
 }
 
 export async function POST(request: NextRequest) {
@@ -114,14 +78,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const fileDir = path.join(UPLOAD_DIR, cleanId);
+    ensureDir(fileDir);
+
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
     if (totalChunks === 1) {
-      // Single chunk — upload directly to Vercel Blob as a private object
-      const blob = await put(`uploads/${cleanId}/${fileName}`, file, {
-        access: BLOB_ACCESS,
-        contentType: fileType,
-        addRandomSuffix: false,
-        allowOverwrite: true,
-      });
+      // Single chunk — write directly
+      const filePath = path.join(fileDir, fileName);
+      fs.writeFileSync(filePath, buffer);
 
       const meta = {
         id: cleanId,
@@ -129,8 +95,14 @@ export async function POST(request: NextRequest) {
         size: fileSize,
         type: fileType,
         uploadedAt: Date.now(),
-        pathname: blob.pathname,
+        pathname: filePath,
       };
+
+      // Write meta JSON
+      fs.writeFileSync(
+        path.join(fileDir, "meta.json"),
+        JSON.stringify(meta),
+      );
 
       return NextResponse.json({
         success: true,
@@ -139,56 +111,54 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Multi-chunk: store each chunk as a temporary private blob
-    const chunkBlobPath = `uploads/${cleanId}/_chunks/chunk_${String(chunkIndex).padStart(5, "0")}`;
-    await put(chunkBlobPath, file, {
-      access: BLOB_ACCESS,
-      contentType: "application/octet-stream",
-      addRandomSuffix: false,
-      allowOverwrite: true,
-    });
+    // Multi-chunk: write each chunk to disk
+    const chunksDir = path.join(fileDir, "_chunks");
+    ensureDir(chunksDir);
+
+    const chunkFileName = `chunk_${String(chunkIndex).padStart(5, "0")}`;
+    fs.writeFileSync(path.join(chunksDir, chunkFileName), buffer);
 
     const isComplete = chunkIndex >= totalChunks - 1;
 
     if (isComplete) {
-      // Download all chunks in order and combine them. `get()` attaches the bearer
-      // token that private blobs require; a bare fetch() against the blob URL would 401.
+      // Reassemble all chunks
       const chunks: Buffer[] = [];
-
       for (let i = 0; i < totalChunks; i++) {
-        const chunkPath = `uploads/${cleanId}/_chunks/chunk_${String(i).padStart(5, "0")}`;
-        try {
-          chunks.push(await readBlobBuffer(chunkPath));
-        } catch (err) {
+        const chunkPath = path.join(
+          chunksDir,
+          `chunk_${String(i).padStart(5, "0")}`,
+        );
+        if (!fs.existsSync(chunkPath)) {
           return NextResponse.json(
-            { error: `Failed to retrieve chunk ${i}` },
+            { error: `Chunk ${i} not found` },
             { status: 500 },
           );
         }
+        chunks.push(fs.readFileSync(chunkPath));
       }
 
-      const combinedBuffer = Buffer.concat(chunks);
-
-      // Upload the combined file
-      const blob = await put(`uploads/${cleanId}/${fileName}`, combinedBuffer, {
-        access: BLOB_ACCESS,
-        contentType: fileType,
-        addRandomSuffix: false,
-        allowOverwrite: true,
-        multipart: true,
-      });
-
-      // Clean up temporary chunk blobs (fire and forget)
-      cleanupChunks(cleanId, totalChunks).catch(() => {});
+      const combined = Buffer.concat(chunks);
+      const finalPath = path.join(fileDir, fileName);
+      fs.writeFileSync(finalPath, combined);
 
       const meta = {
         id: cleanId,
         name: fileName,
-        size: fileSize,
+        size: combined.length,
         type: fileType,
         uploadedAt: Date.now(),
-        pathname: blob.pathname,
+        pathname: finalPath,
       };
+
+      fs.writeFileSync(
+        path.join(fileDir, "meta.json"),
+        JSON.stringify(meta),
+      );
+
+      // Clean up chunks directory (fire and forget)
+      try {
+        fs.rmSync(chunksDir, { recursive: true, force: true });
+      } catch {}
 
       return NextResponse.json({
         success: true,
@@ -213,33 +183,9 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Clean up temporary chunk blobs after successful assembly.
-// `del()` forwards its input verbatim as `urls` to the control plane (it does NOT
-// translate pathnames), so the concrete URLs are resolved via `list()` first.
-async function cleanupChunks(cleanId: string, totalChunks: number) {
-  const urlsToDelete: string[] = [];
-  for (let i = 0; i < totalChunks; i++) {
-    const chunkPath = `uploads/${cleanId}/_chunks/chunk_${String(i).padStart(5, "0")}`;
-    try {
-      const result = await list({ prefix: chunkPath, limit: 1 });
-      if (result.blobs.length > 0) {
-        urlsToDelete.push(result.blobs[0].url);
-      }
-    } catch {
-      // Ignore individual lookup errors
-    }
-  }
-  if (urlsToDelete.length > 0) {
-    await del(urlsToDelete);
-  }
-}
-
-// Private blobs cannot be redirected to — their host requires a bearer token that must
-// never reach the browser. Content is streamed through this handler instead.
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const fileId = searchParams.get("fileId");
-  const requestedPathname = searchParams.get("pathname");
 
   if (!fileId) {
     return NextResponse.json({ error: "fileId is required" }, { status: 400 });
@@ -250,76 +196,54 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Invalid fileId" }, { status: 400 });
   }
 
-  const allowedPrefix = `uploads/${cleanId}/`;
+  const fileDir = path.join(UPLOAD_DIR, cleanId);
 
-  // A client-supplied pathname is accepted only when it stays inside this file's own
-  // folder. Without that check any object in the store could be read by pathname.
-  let pathname: string | null = null;
-
-  if (
-    requestedPathname &&
-    requestedPathname.startsWith(allowedPrefix) &&
-    !requestedPathname.includes("/_chunks/")
-  ) {
-    pathname = requestedPathname;
-  } else {
-    try {
-      const result = await list({ prefix: allowedPrefix, limit: 10 });
-      const mainBlob = result.blobs.find(
-        (b) => !b.pathname.includes("/_chunks/"),
-      );
-      if (mainBlob) {
-        pathname = mainBlob.pathname;
-      }
-    } catch {
-      // Fall through to 404
-    }
-  }
-
-  if (!pathname) {
+  if (!fs.existsSync(fileDir)) {
     return NextResponse.json({ error: "File not found" }, { status: 404 });
   }
 
-  try {
-    const fetched = await readBlobForDownload(pathname);
-    if (!fetched || !fetched.stream) {
+  // Read meta.json to get the actual filename and type
+  const metaPath = path.join(fileDir, "meta.json");
+  let meta: { name: string; type: string; pathname: string } | null = null;
+
+  if (fs.existsSync(metaPath)) {
+    try {
+      meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+    } catch {}
+  }
+
+  // Fallback: pick first non-meta file
+  let filePath: string | null = meta?.pathname || null;
+  if (!filePath || !fs.existsSync(filePath)) {
+    const files = fs
+      .readdirSync(fileDir)
+      .filter((f) => f !== "meta.json" && !f.startsWith("_"));
+    if (files.length === 0) {
       return NextResponse.json({ error: "File not found" }, { status: 404 });
     }
-
-    const downloadName = escapeFileName(
-      pathname.split("/").pop() || "download",
-    );
-
-    const headers = new Headers();
-    headers.set(
-      "Content-Type",
-      fetched.blob.contentType || "application/octet-stream",
-    );
-    headers.set(
-      "Content-Disposition",
-      `attachment; filename="${downloadName}"; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
-    );
-    headers.set("Cache-Control", "no-store");
-
-    return new Response(fetched.stream as unknown as ReadableStream, {
-      status: 200,
-      headers,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return NextResponse.json(
-      { error: "Download failed: " + message },
-      { status: 500 },
-    );
+    filePath = path.join(fileDir, files[0]);
   }
+
+  const fileName = escapeFileName(path.basename(filePath));
+  const contentType = meta?.type || "application/octet-stream";
+  const fileBuffer = fs.readFileSync(filePath);
+
+  const headers = new Headers();
+  headers.set("Content-Type", contentType);
+  headers.set(
+    "Content-Disposition",
+    `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+  );
+  headers.set("Content-Length", String(fileBuffer.length));
+  headers.set("Cache-Control", "no-store");
+
+  return new Response(fileBuffer, { status: 200, headers });
 }
 
 export async function DELETE(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const fileId = searchParams.get("fileId");
 
-  // Deleting by raw URL is intentionally not supported: it would let any caller pass an
-  // arbitrary store URL. Everything is scoped to the caller's own file folder prefix.
   if (!fileId) {
     return NextResponse.json({ error: "fileId is required" }, { status: 400 });
   }
@@ -329,12 +253,12 @@ export async function DELETE(request: NextRequest) {
     return NextResponse.json({ error: "Invalid fileId" }, { status: 400 });
   }
 
-  try {
-    const result = await list({ prefix: `uploads/${cleanId}/` });
-    if (result.blobs.length > 0) {
-      await del(result.blobs.map((b) => b.url));
-    }
+  const fileDir = path.join(UPLOAD_DIR, cleanId);
 
+  try {
+    if (fs.existsSync(fileDir)) {
+      fs.rmSync(fileDir, { recursive: true, force: true });
+    }
     return NextResponse.json({
       success: true,
       message: `File ${cleanId} deleted`,
